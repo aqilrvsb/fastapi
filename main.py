@@ -1,27 +1,25 @@
-# app/main.py
+# main.py
 import os
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
-app = FastAPI(title="GPT-OSS FastAPI ↔ Ollama Gateway")
+app = FastAPI(title="GPT-OSS FastAPI Gateway")
 
-# ---- Railway vars ----
 UPSTREAM = os.getenv("UPSTREAM", "gpt-oss-model.railway.internal")
 UPSTREAM_PORT = os.getenv("UPSTREAM_PORT", "11434")
-OLLAMA_BASE = f"http://{UPSTREAM}:{UPSTREAM_PORT}"
+BASE = f"http://{UPSTREAM}:{UPSTREAM_PORT}"
 
-# Optional gateway key (leave unset to disable auth)
-GATEWAY_API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")  # optional
 
-def require_auth(authorization: Optional[str]):
-    if not GATEWAY_API_KEY:
+def require_auth(auth: Optional[str]):
+    if not API_KEY:
         return
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    if authorization.split(" ", 1)[1] != GATEWAY_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(401, "Missing Authorization header")
+    if auth.split(" ", 1)[1] != API_KEY:
+        raise HTTPException(403, "Invalid API key")
 
 @app.get("/")
 def root():
@@ -29,64 +27,77 @@ def root():
 
 @app.get("/health")
 async def health():
-    # Ping Ollama to confirm connectivity
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{OLLAMA_BASE}/api/tags")
-        return {"upstream_status": r.status_code, "upstream_ok": r.status_code == 200}
+        # Try Ollama first
+        try:
+            r = await client.get(f"{BASE}/api/tags")
+            if r.status_code == 200:
+                models = [m.get("name") for m in r.json().get("models", []) if isinstance(m, dict)]
+                return {"ok": True, "backend": "ollama", "base": BASE, "models": models}
+        except Exception:
+            pass
+        # Try OpenAI-compatible
+        try:
+            r = await client.get(f"{BASE}/v1/models")
+            if r.status_code == 200:
+                models = [m.get("id") for m in r.json().get("data", [])]
+                return {"ok": True, "backend": "openai-compatible", "base": BASE, "models": models}
+        except Exception:
+            pass
+    return {"ok": False, "base": BASE, "error": "Could not reach upstream"}
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
+async def chat(request: Request, authorization: Optional[str] = Header(None)):
     require_auth(authorization)
+    body: Dict[str, Any] = await request.json()
+    model = body.get("model", "llama3.1")
+    messages = body.get("messages", [])
+    stream = bool(body.get("stream", False))
 
-    payload: Dict[str, Any] = await request.json()
-    # OpenAI-style fields
-    model = payload.get("model", "llama3.1")
-    messages = payload.get("messages", [])
-    stream = bool(payload.get("stream", False))
-    temperature = payload.get("temperature", 0.7)
-    top_p = payload.get("top_p", 0.95)
-    max_tokens = payload.get("max_tokens")  # optional
-
-    # Convert OpenAI → Ollama
-    ollama_body: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,          # Ollama supports messages with {role, content}
-        "stream": stream,
-        "options": {
-            "temperature": temperature,
-            "top_p": top_p,
-        },
-    }
-    if max_tokens is not None:
-        ollama_body["options"]["num_predict"] = max_tokens
-
+    # Detect backend per-request
     async with httpx.AsyncClient(timeout=httpx.Timeout(60, read=300)) as client:
-        if not stream:
-            r = await client.post(f"{OLLAMA_BASE}/api/chat", json=ollama_body)
-            r.raise_for_status()
-            data = r.json()
-            # Convert Ollama → OpenAI-ish response
-            content = "".join((m.get("content", "") for m in data.get("message", {}) and [data["message"]]))
-            return JSONResponse({
-                "id": "chatcmpl-ollama",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": data.get("message", {"role": "assistant", "content": content}),
-                    "finish_reason": data.get("done_reason", "stop")
-                }],
-                "model": model
-            })
+        # Is it Ollama?
+        try:
+            r = await client.get(f"{BASE}/api/tags")
+            is_ollama = (r.status_code == 200)
+        except Exception:
+            is_ollama = False
 
-        async def streamer():
-            async with client.stream("POST", f"{OLLAMA_BASE}/api/chat", json=ollama_body) as r:
+        if is_ollama:
+            # ---- OpenAI -> Ollama translate ----
+            payload = {"model": model, "messages": messages, "stream": stream}
+            if not stream:
+                r = await client.post(f"{BASE}/api/chat", json=payload)
                 r.raise_for_status()
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    # Ollama streams JSON lines; forward as OpenAI SSE chunks
-                    # Minimal transform for compatibility
-                    yield f"data: {line}\n\n"
-                yield "data: [DONE]\n\n"
+                data = r.json()
+                content = data.get("message", {}).get("content", "")
+                return JSONResponse({
+                    "id": "chatcmpl-ollama",
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": data.get("done_reason", "stop")
+                    }]
+                })
+            async def streamer():
+                async with client.stream("POST", f"{BASE}/api/chat", json=payload) as r:
+                    r.raise_for_status()
+                    async for line in r.aiter_lines():
+                        if line:
+                            yield f"data: {line}\n\n"
+                    yield "data: [DONE]\n\n"
+            return StreamingResponse(streamer(), media_type="text/event-stream")
 
-        return StreamingResponse(streamer(), media_type="text/event-stream")
+        # ---- OpenAI-compatible upstream: simple pass-through ----
+        if not stream:
+            r = await client.post(f"{BASE}/v1/chat/completions", json=body)
+            return JSONResponse(status_code=r.status_code, content=r.json())
+
+        async def streamer2():
+            async with client.stream("POST", f"{BASE}/v1/chat/completions", json=body) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+        return StreamingResponse(streamer2(), media_type="text/event-stream")
